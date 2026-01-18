@@ -1,0 +1,356 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>For  - Gesture Particles</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #050505; font-family: monospace; }
+        #canvas-container { position: absolute; top: 0; left: 0; width: 100%; height: 100%; z-index: 1; }
+        
+        /* UI Debugger */
+        #ui-panel {
+            position: absolute; top: 20px; left: 20px; z-index: 10;
+            background: rgba(10, 10, 10, 0.85); border: 1px solid #333;
+            padding: 15px; border-radius: 8px; color: white; width: 240px;
+            box-shadow: 0 0 20px rgba(0,0,0,0.5);
+            transition: border-color 0.3s;
+        }
+        h2 { font-size: 14px; margin: 0 0 10px 0; color: #fff; border-bottom: 1px solid #333; padding-bottom: 5px; }
+        .debug-item { display: flex; justify-content: space-between; font-size: 11px; margin-bottom: 4px; color: #888; }
+        .debug-item.ok { color: #00ff88; font-weight: bold; }
+        
+        #main-status {
+            margin-top: 10px; padding-top: 10px; border-top: 1px solid #333;
+            text-align: center; font-size: 14px; color: #fff; font-weight: bold;
+        }
+
+        #loading {
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            color: #00ffff; z-index: 20; font-size: 18px; background: rgba(0,0,0,0.8);
+            padding: 20px; border-radius: 10px; pointer-events: none;
+            text-align: center; border: 1px solid #00ffff;
+        }
+
+        #webcam { transform: scaleX(-1); display: none; }
+    </style>
+</head>
+<body>
+
+    <video id="webcam" autoplay playsinline></video>
+    <div id="loading">Memproses Geometri...<br><span style="font-size:12px">Mohon Tunggu</span></div>
+
+    <div id="ui-panel">
+        <h2>Hand Tracker Debug</h2>
+        <div class="debug-item" id="dbg-thumb">Jempol: -</div>
+        <div class="debug-item" id="dbg-index">Telunjuk: -</div>
+        <div class="debug-item" id="dbg-middle">Tengah: -</div>
+        <div class="debug-item" id="dbg-ring">Manis: -</div>
+        <div class="debug-item" id="dbg-pinky">Kelingking: -</div>
+        <div id="main-status">Menunggu Tangan...</div>
+    </div>
+
+    <div id="canvas-container"></div>
+
+    <script type="importmap">
+        {
+            "imports": {
+                "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+                "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/",
+                "@mediapipe/tasks-vision": "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/+esm"
+            }
+        }
+    </script>
+
+    <script type="module">
+        import * as THREE from 'three';
+        import { FontLoader } from 'three/addons/loaders/FontLoader.js';
+        import { TextGeometry } from 'three/addons/geometries/TextGeometry.js';
+        import { FilesetResolver, HandLandmarker } from '@mediapipe/tasks-vision';
+
+        // --- KONFIGURASI ---
+        const PARTICLE_COUNT = 15000; // Ditambah agar teks panjang tetap padat
+        const PARTICLE_SIZE = 0.04;
+        
+        // --- VARIABLE SYSTEM ---
+        let scene, camera, renderer, particles;
+        let handLandmarker = undefined;
+        let webcam = document.getElementById('webcam');
+        let lastVideoTime = -1;
+        
+        // --- LOGIC STATES ---
+        let currentMode = 'IDLE'; 
+        let rotationSpeed = 0.003;
+        
+        // Warna
+        const colorIdle = new THREE.Color(0x00ffff);   // Cyan
+        const colorLove = new THREE.Color(0xff1493);   // Pink
+        const colorExplode = new THREE.Color(0xffd700); // Gold/Orange
+
+        // --- 1. SETUP 3D ---
+        function initThreeJS() {
+            const container = document.getElementById('canvas-container');
+            scene = new THREE.Scene();
+            
+            // Kamera sedikit mundur (z=9) agar 2 baris teks muat
+            camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 1000);
+            camera.position.z = 9; 
+
+            renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+            renderer.setSize(window.innerWidth, window.innerHeight);
+            container.appendChild(renderer.domElement);
+
+            window.addEventListener('resize', () => {
+                camera.aspect = window.innerWidth / window.innerHeight;
+                camera.updateProjectionMatrix();
+                renderer.setSize(window.innerWidth, window.innerHeight);
+            });
+
+            loadFont();
+        }
+
+        // --- 2. GENERATE PARTICLES ---
+        function loadFont() {
+            const loader = new FontLoader();
+            loader.load('https://unpkg.com/three@0.160.0/examples/fonts/helvetiker_bold.typeface.json', (font) => {
+                
+                // --- BAGIAN INI YANG DIUBAH UNTUK NAMA  ---
+                const textGeo = new TextGeometry('I LOVE YOU\n Bubub Anwar', {
+                    font: font, 
+                    size: 0.8,      // Diperkecil agar muat
+                    height: 0.1,    // Ketebalan
+                    curveSegments: 6
+                });
+                textGeo.center(); // Otomatis tengah
+                
+                // Ambil titik permukaan teks (Surface Sampling)
+                const textPositions = sampleMeshSurface(textGeo, PARTICLE_COUNT);
+                createParticles(textPositions);
+                
+                document.getElementById('loading').style.display = 'none';
+                initHandTracking();
+                animate();
+            });
+        }
+
+        function sampleMeshSurface(geometry, count) {
+            const posAttribute = geometry.attributes.position;
+            const faces = posAttribute.count / 3;
+            const points = [];
+            
+            for (let i = 0; i < count; i++) {
+                const faceIndex = Math.floor(Math.random() * faces);
+                const i0 = faceIndex * 3;
+                const i1 = faceIndex * 3 + 1;
+                const i2 = faceIndex * 3 + 2;
+
+                const vA = new THREE.Vector3(posAttribute.getX(i0), posAttribute.getY(i0), posAttribute.getZ(i0));
+                const vB = new THREE.Vector3(posAttribute.getX(i1), posAttribute.getY(i1), posAttribute.getZ(i1));
+                const vC = new THREE.Vector3(posAttribute.getX(i2), posAttribute.getY(i2), posAttribute.getZ(i2));
+
+                let r1 = Math.random();
+                let r2 = Math.random();
+                if (r1 + r2 > 1) { r1 = 1 - r1; r2 = 1 - r2; }
+                
+                const p = new THREE.Vector3()
+                    .addScaledVector(vA, r1).addScaledVector(vB, r2).addScaledVector(vC, 1 - r1 - r2);
+                points.push(p.x, p.y, p.z);
+            }
+            return points;
+        }
+
+        function createParticles(textPosArray) {
+            const geometry = new THREE.BufferGeometry();
+            const currentPos = []; 
+            const spherePos = [];
+            const explodePos = [];
+
+            const radius = 3.5; // Radius bola sedikit dibesarkan
+
+            for (let i = 0; i < PARTICLE_COUNT; i++) {
+                // 1. Posisi BOLA (IDLE)
+                const phi = Math.acos(-1 + (2 * i) / PARTICLE_COUNT);
+                const theta = Math.sqrt(PARTICLE_COUNT * Math.PI) * phi;
+                const x = radius * Math.cos(theta) * Math.sin(phi);
+                const y = radius * Math.sin(theta) * Math.sin(phi);
+                const z = radius * Math.cos(phi);
+
+                spherePos.push(x, y, z);
+                currentPos.push(x, y, z); 
+
+                // 2. Posisi EXPLODE
+                const explodeScale = 6.0 + Math.random() * 4.0; 
+                explodePos.push(
+                    x * explodeScale + (Math.random()-0.5), 
+                    y * explodeScale + (Math.random()-0.5), 
+                    z * explodeScale + (Math.random()-0.5)
+                );
+            }
+
+            geometry.setAttribute('position', new THREE.Float32BufferAttribute(currentPos, 3));
+            geometry.userData = { 
+                posSphere: spherePos,
+                posText: textPosArray,
+                posExplode: explodePos
+            };
+
+            const material = new THREE.PointsMaterial({
+                color: colorIdle,
+                size: PARTICLE_SIZE,
+                transparent: true, opacity: 0.9,
+                blending: THREE.AdditiveBlending,
+                depthWrite: false
+            });
+
+            particles = new THREE.Points(geometry, material);
+            scene.add(particles);
+        }
+
+        // --- 3. HAND TRACKING ---
+        async function initHandTracking() {
+            const vision = await FilesetResolver.forVisionTasks(
+                "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/wasm"
+            );
+            handLandmarker = await HandLandmarker.createFromOptions(vision, {
+                baseOptions: {
+                    modelAssetPath: `https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task`,
+                    delegate: "GPU"
+                },
+                runningMode: "VIDEO",
+                numHands: 1
+            });
+            startWebcam();
+        }
+
+        function startWebcam() {
+            navigator.mediaDevices.getUserMedia({ video: true }).then((stream) => {
+                webcam.srcObject = stream;
+                webcam.addEventListener("loadeddata", predictWebcam);
+            });
+        }
+
+        function isFingerExtended(landmarks, tipIdx, pipIdx) {
+            const wrist = landmarks[0];
+            const tip = landmarks[tipIdx];
+            const pip = landmarks[pipIdx];
+            const distTip = Math.sqrt((tip.x-wrist.x)**2 + (tip.y-wrist.y)**2);
+            const distPip = Math.sqrt((pip.x-wrist.x)**2 + (pip.y-wrist.y)**2);
+            return distTip > (distPip * 1.15); 
+        }
+
+        async function predictWebcam() {
+            if (handLandmarker && webcam.currentTime !== lastVideoTime) {
+                lastVideoTime = webcam.currentTime;
+                const results = handLandmarker.detectForVideo(webcam, performance.now());
+                
+                const uiStatus = document.getElementById('main-status');
+                const uiPanel = document.getElementById('ui-panel');
+
+                const updateUI = (id, isOpen) => {
+                    const el = document.getElementById(id);
+                    el.innerText = isOpen ? "LURUS" : "Tekuk";
+                    el.className = isOpen ? "debug-item ok" : "debug-item";
+                };
+
+                if (results.landmarks && results.landmarks.length > 0) {
+                    const lm = results.landmarks[0];
+                    
+                    const thumbOpen = isFingerExtended(lm, 4, 2);
+                    const indexOpen = isFingerExtended(lm, 8, 6);
+                    const middleOpen = isFingerExtended(lm, 12, 10);
+                    const ringOpen = isFingerExtended(lm, 16, 14);
+                    const pinkyOpen = isFingerExtended(lm, 20, 18);
+
+                    updateUI('dbg-thumb', thumbOpen);
+                    updateUI('dbg-index', indexOpen);
+                    updateUI('dbg-middle', middleOpen);
+                    updateUI('dbg-ring', ringOpen);
+                    updateUI('dbg-pinky', pinkyOpen);
+
+                    // LOGIKA MODE
+                    if (thumbOpen && indexOpen && middleOpen && ringOpen && pinkyOpen) {
+                        currentMode = 'EXPLODE';
+                        uiStatus.innerText = "💥 MODE: BERPENCAR 💥";
+                        uiStatus.style.color = "#ffd700";
+                        uiPanel.style.borderColor = "#ffd700";
+                    }
+                    else if (thumbOpen && indexOpen && !middleOpen && !ringOpen && !pinkyOpen) {
+                        currentMode = 'LOVE';
+                        uiStatus.innerHTML = "❤️ FOR  ❤️"; // Update Text UI
+                        uiStatus.style.color = "#ff1493";
+                        uiPanel.style.borderColor = "#ff1493";
+                    }
+                    else {
+                        currentMode = 'IDLE';
+                        uiStatus.innerText = "Mode: Bola (Idle)";
+                        uiStatus.style.color = "#fff";
+                        uiPanel.style.borderColor = "#333";
+                    }
+
+                } else {
+                    currentMode = 'IDLE';
+                    uiStatus.innerText = "Mencari Tangan...";
+                }
+            }
+            window.requestAnimationFrame(predictWebcam);
+        }
+
+        // --- 4. ANIMATION LOOP ---
+        function animate() {
+            requestAnimationFrame(animate);
+
+            if (particles) {
+                // Rotasi Logic
+                let targetRotSpeed = 0.003;
+                if (currentMode === 'LOVE') targetRotSpeed = 0; 
+                if (currentMode === 'EXPLODE') targetRotSpeed = 0.01;
+                
+                rotationSpeed += (targetRotSpeed - rotationSpeed) * 0.05;
+                particles.rotation.y += rotationSpeed;
+
+                // Fix Posisi Depan untuk Teks
+                if (currentMode === 'LOVE') {
+                    let currentRot = particles.rotation.y % (Math.PI * 2);
+                    if (currentRot > Math.PI) currentRot -= Math.PI * 2;
+                    particles.rotation.y -= currentRot * 0.05;
+                }
+
+                // Warna Logic
+                let targetColor;
+                if (currentMode === 'EXPLODE') targetColor = colorExplode;
+                else if (currentMode === 'LOVE') targetColor = colorLove;
+                else targetColor = colorIdle;
+                
+                particles.material.color.lerp(targetColor, 0.05);
+
+                // Morphing Logic
+                const positions = particles.geometry.attributes.position.array;
+                const sphere = particles.geometry.userData.posSphere;
+                const text = particles.geometry.userData.posText;
+                const explode = particles.geometry.userData.posExplode;
+                
+                let targetArray;
+                if (currentMode === 'EXPLODE') targetArray = explode;
+                else if (currentMode === 'LOVE') targetArray = text;
+                else targetArray = sphere;
+
+                for (let i = 0; i < PARTICLE_COUNT; i++) {
+                    const idx = i * 3;
+                    const speed = 0.08;
+
+                    positions[idx]   += (targetArray[idx]   - positions[idx])   * speed;
+                    positions[idx+1] += (targetArray[idx+1] - positions[idx+1]) * speed;
+                    positions[idx+2] += (targetArray[idx+2] - positions[idx+2]) * speed;
+                }
+                
+                particles.geometry.attributes.position.needsUpdate = true;
+            }
+
+            renderer.render(scene, camera);
+        }
+
+        initThreeJS();
+
+    </script>
+</body>
+</html>
